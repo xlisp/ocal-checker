@@ -489,8 +489,7 @@ def diagnose(m, args):
 def render_report(path_label, m, issues, actions):
     icon = {"ok": "✅", "warn": "⚠️ ", "bad": "❌"}
     lines = [f"\n====== OCAL 光轴分析：{path_label} ======"]
-    lines.append(f"[测量] 蓝圈半径 {m['ratio'] and ''}换算比例 {m['scale']:.3f} 截图px/OCALpx；"
-                 f"绿/蓝半径比 {m['ratio']:.3f}")
+    lines.append(f"[测量] 换算比例 {m['scale']:.3f} 截图px/OCALpx；绿/蓝半径比 {m['ratio']:.3f}")
     gb = m["gb_vec"]
     lines.append(f"[测量] 绿圈相对蓝圈：{vec_words(gb[0], gb[1])}（轴向 {m['axial_pct']:.1f}% / 横向 {m['lateral_pct']:.1f}%）")
     lines.append("")

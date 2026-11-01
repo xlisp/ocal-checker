@@ -25,6 +25,7 @@ OCAL 叠加的绿圈/蓝圈/红圈共用同一个圆心，它们互相比较永�
 from __future__ import annotations
 
 import argparse
+import copy
 import math
 import subprocess
 import sys
@@ -44,6 +45,10 @@ ELL_OK = 0.02
 ELL_BAD = 0.05
 PRI_OK = 2.0        # 主镜中心标记 vs 准星中心
 PRI_BAD = 5.0
+# --compare 对比两种状态时，变化超过这些值才算“真实变化”（低于测量误差的不算）
+PRI_DELTA = 3.0     # 主镜中心偏差变化(百分点)
+POS_DELTA = 1.5     # 副镜位置偏差变化(百分点)
+ELL_DELTA = 0.02    # 副镜净椭圆度变化
 
 
 class AnalysisError(Exception):
@@ -425,6 +430,39 @@ def annotate(img, green, blue, cross_c, m):
 # --------------------------------------------------------------------------- #
 # 诊断规则
 # --------------------------------------------------------------------------- #
+def net_ellipticity(m):
+    """副镜净椭圆度：若调焦座同向呈椭圆，则扣除这部分(镜头/相机引入)。返回 (值, 是否扣除过)"""
+    sec, foc = m["sec"], m["foc"]
+    if sec is None:
+        return None, False
+    el = sec["ellipticity"]
+    if foc is not None and foc["ellipticity"] > ELL_OK * 0.5 and \
+            angle_diff(sec["major_angle"], foc["major_angle"]) < 30:
+        return max(el - foc["ellipticity"], 0.0), True
+    return el, False
+
+
+def measure_lines(m):
+    L = [f"[测量] 换算比例 {m['scale']:.3f} 截图px/OCALpx；调焦座半径≈{m['Rb']:.0f}px"]
+    if m["off_vec"] is not None:
+        d = m["off_vec"]
+        L.append(f"[测量] 副镜中心相对调焦座中心：{vec_words(d[0], d[1])}"
+                 f"（轴向 {m['axial_pct']:.1f}% / 横向 {m['lateral_pct']:.1f}%）")
+    if m["sec"] is not None:
+        sc_ = m["sec"]
+        L.append(f"[测量] 副镜椭圆度 {sc_['ellipticity'] * 100:.1f}%（长轴方向约 {sc_['major_angle']:.0f}°）")
+    if m["foc"] is not None:
+        fc_ = m["foc"]
+        L.append(f"[测量] 调焦座椭圆度 {fc_['ellipticity'] * 100:.1f}%（长轴方向约 {fc_['major_angle']:.0f}°）"
+                 "——调焦座内壁实际是正圆，这个数反映相机/镜头引入的基准误差")
+        net, sub_ = net_ellipticity(m)
+        if net is not None:
+            L.append(f"[测量] 副镜净椭圆度 {net * 100:.1f}%" + ("（已扣除调焦座同向椭圆）" if sub_ else
+                                                                 "（调焦座基本是正圆，无需扣除）" if fc_["ellipticity"] <= ELL_OK * 0.5 else
+                                                                 "（长轴与调焦座不同向，未扣除）"))
+    return L
+
+
 def diagnose(m, args):
     """返回 (issues, actions)。issues: [(level, 标题, 详情)]; level ∈ ok/warn/bad"""
     issues, actions = [], []
@@ -526,20 +564,18 @@ def diagnose(m, args):
                 f"（需向{vec_words(-pv[0], -pv[1])}）。每次只动一颗，看标记移动方向，找到各螺丝对应的方向后再组合调整。"
                 "副镜这一步只对准「主镜中心」；之后再用主镜背后三颗螺丝把准星对准副镜里的反射影像。")
 
-    # 5) 组合模式：“二选一”
-    if pri_bad and (conc_bad or ell_bad):
-        issues.append(("bad", "出现“二选一”特征：位置/椭圆/主镜中心不能同时满足",
-                       "三颗倾斜螺丝只能补偿小角度，补偿不了位置偏差。这是支架或调焦座的几何问题，不是调得不够细。"))
+    # 5) 单张图只能说明“现在偏了多少”，证明不了“调这个会牵连那个”
+    if pri_bad:
         actions.append(
-            "【几何排查，按这个顺序】\n"
-            "      ① 先把三颗倾斜螺丝都退到行程中间；若调到哪颗已接近到底，说明偏差超出补偿范围。\n"
-            "      ② 调焦座垂直度：拆下副镜，量调焦座底座左右两端到镜筒前端口的距离是否相等；水平仪比对接口面与镜筒参考面。\n"
-            "      ③ 三臂支架：量三个固定点到镜筒前端口的距离（应一致，误差 <0.5mm）、三条臂长度是否相等；"
-            "你改过原厂孔位，要重点看新旧孔位是否有高低差。\n"
-            "      ④ 副镜安装面 45° 角与贴合度。\n"
-            "      发现某一点偏低，就在对应固定点垫薄垫片，修好后整套重新校准。")
-    elif pri_bad and sec is not None and not conc_bad and not ell_bad:
-        actions.append("副镜位置和形状都正常、只有主镜中心偏：这是纯倾斜问题，上面的倾斜步骤就能解决。")
+            "【先看倾斜螺丝行程】把副镜三颗倾斜螺丝逐颗看一下：有没有哪颗已经拧到底或几乎松脱？"
+            "若有，说明倾斜补偿已到头，再去查调焦座垂直度和三臂支架高度；若都在行程中间，就是还没调到位。")
+        if conc_bad or ell_bad:
+            issues.append(("warn", "主镜中心偏，同时副镜位置或形状也有偏差",
+                           "单张图无法判断两者是否互相牵连。把“主镜中心进去”的状态也拍一张，"
+                           "用 --compare A.png B.png --primary X Y --primary-b X Y 对比两个状态。"))
+        elif sec is not None:
+            actions.append("按单张图判断：副镜位置和形状都在误差内，只有主镜中心偏，先按上面的倾斜步骤调。"
+                           "若调到主镜中心进去后副镜明显变形或位移，再用 --compare 对比确认。")
     if not (pri_bad or conc_bad or ell_bad) and m["cam_pct"] <= TOL_CAM and sec is not None and pri is not None:
         actions.append("光轴几何看起来良好：可以进入主镜精调，再用星点离焦环（星点测试）做最终确认。")
 
@@ -551,14 +587,7 @@ def diagnose(m, args):
 def render_report(path_label, m, issues, actions):
     icon = {"ok": "✅", "warn": "⚠️ ", "bad": "❌"}
     lines = [f"\n====== OCAL 光轴分析：{path_label} ======"]
-    lines.append(f"[测量] 换算比例 {m['scale']:.3f} 截图px/OCALpx；调焦座半径≈{m['Rb']:.0f}px")
-    if m["off_vec"] is not None:
-        d = m["off_vec"]
-        lines.append(f"[测量] 副镜中心相对调焦座中心：{vec_words(d[0], d[1])}"
-                     f"（轴向 {m['axial_pct']:.1f}% / 横向 {m['lateral_pct']:.1f}%）")
-    if m["sec"] is not None:
-        lines.append(f"[测量] 副镜椭圆度 {m['sec']['ellipticity'] * 100:.1f}%"
-                     + (f"；调焦座椭圆度 {m['foc']['ellipticity'] * 100:.1f}%" if m["foc"] else ""))
+    lines.extend(measure_lines(m))
     lines.append("")
     lines.append("— 诊断 —")
     for level, title, detail in issues:
@@ -627,6 +656,89 @@ def watch(folder: Path, args):
         time.sleep(1.5)
 
 
+def run_compare(pa: Path, pb: Path, args):
+    """对比同一把镜子的两种状态（如：副镜正圆/主镜中心进不去  vs  主镜中心进去/副镜变椭圆）。"""
+    items = []
+    for p, prim in ((pa, args.primary), (pb, args.primary_b)):
+        a_ = copy.copy(args)
+        a_.primary = prim
+        img = imread_unicode(p)
+        m, ann = analyze(img, a_)
+        ok, buf = cv2.imencode(".png", ann)
+        if ok:
+            buf.tofile(str(p.with_name(p.stem + "_analysis.png")))
+        items.append((p, m))
+    (na, ma), (nb, mb) = items
+    for nm, m in items:
+        if m["primary_pct"] is None or m["sec"] is None:
+            raise AnalysisError(f"对比需要两张图都有主镜中心和副镜边缘：{nm.name} 缺失。"
+                                "请用 --primary/--primary-b 给坐标，或加 --pick 手点。")
+
+    def pos(m):
+        return math.hypot(m["axial"], m["lateral"]) / m["Rb"] * 100
+
+    nA, nB = net_ellipticity(ma)[0], net_ellipticity(mb)[0]
+    print(f"\n====== OCAL 两状态对比 ======\nA = {na.name}\nB = {nb.name}\n")
+    for tag, nm, m in (("A", na, ma), ("B", nb, mb)):
+        print(f"--- {tag} ---")
+        for ln in measure_lines(m):
+            print(ln)
+        print(f"[测量] 主镜中心偏离准星 {m['primary_pct']:.1f}%；准星偏离调焦座 {m['cam_pct']:.1f}%")
+    print("\n项目                      A         B       变化(B-A)")
+    rows = [
+        ("主镜中心偏差 %", ma["primary_pct"], mb["primary_pct"]),
+        ("副镜位置偏差 %", pos(ma), pos(mb)),
+        ("副镜净椭圆度 %", nA * 100, nB * 100),
+        ("准星偏离调焦座 %", ma["cam_pct"], mb["cam_pct"]),
+    ]
+    if ma["foc"] and mb["foc"]:
+        rows.append(("调焦座椭圆度 %", ma["foc"]["ellipticity"] * 100, mb["foc"]["ellipticity"] * 100))
+    for name, x, y in rows:
+        print(f"{name:<18}{x:>9.1f}{y:>10.1f}{y - x:>12.1f}")
+
+    # ---- 判断：以“主镜中心更准”的那个状态为 good ----
+    good, other = ((ma, mb) if ma["primary_pct"] <= mb["primary_pct"] else (mb, ma))
+    gname, oname = (("A", "B") if good is ma else ("B", "A"))
+    dP = other["primary_pct"] - good["primary_pct"]
+    dPos = pos(good) - pos(other)
+    dE = net_ellipticity(good)[0] - net_ellipticity(other)[0]
+
+    print("\n— 对比结论 —")
+    base_shift = abs(ma["cam_pct"] - mb["cam_pct"]) > 2.0 or (
+        ma["foc"] and mb["foc"] and abs(ma["foc"]["ellipticity"] - mb["foc"]["ellipticity"]) > ELL_DELTA)
+    if base_shift:
+        print("⚠️  两张图的基准不一致（准星/调焦座椭圆度变化超出误差）：相机位置或角度在两次之间动过，"
+              "下面的结论可信度打折。最好保持相机不动，只调镜子。")
+    if dP < PRI_DELTA:
+        print(f"ℹ️  两个状态的主镜中心偏差只差 {dP:.1f} 个百分点，没有明显区别，这对图没法说明“互相牵连”。"
+              "请确认拍的是“主镜中心进不去”和“主镜中心进去”两个状态。")
+        return
+    print(f"状态 {gname} 的主镜中心明显更准（改善 {dP:.1f} 个百分点）。与状态 {oname} 相比：")
+    pos_worse, ell_worse = dPos >= POS_DELTA, dE >= ELL_DELTA
+    print(f"  副镜位置偏差变化 {dPos:+.1f}（阈值 {POS_DELTA}）→ {'变差' if pos_worse else '在误差内'}")
+    print(f"  副镜净椭圆度变化 {dE * 100:+.1f}（阈值 {ELL_DELTA * 100:.0f}）→ {'变差' if ell_worse else '在误差内'}")
+    if not pos_worse and not ell_worse:
+        print("\n✅ 测量没有证实“拿位置/形状换主镜中心”：主镜中心进去的同时，副镜位置和形状都没明显变差。\n"
+              "   若你肉眼仍觉得是椭圆，用 --pick 手点副镜边缘复核（自动检测在暗边缘上误差较大）；\n"
+              "   肉眼觉得的“椭圆”也可能来自广角畸变，参考调焦座的椭圆度。")
+        return
+    print("\n❌ 证实了互相牵连：倾斜螺丝在把主镜中心拉进来的同时，副镜"
+          + ("位置" if pos_worse else "") + ("和" if pos_worse and ell_worse else "")
+          + ("形状" if ell_worse else "") + "变差。说明所需倾斜量已超出倾斜螺丝的正常补偿范围，偏差来自别处。")
+    if ell_worse and not pos_worse:
+        print("   特征：形状变、位置不变 → 更像副镜面角度问题。优先查：")
+        print("   ① 副镜背面与支架接触面是否贴实、中心螺丝与三颗倾斜螺丝是否互相顶着（有没有一颗已到底）；")
+        print("   ② 副镜安装面本身是否 45°（量角器/水平仪）；③ 调焦座垂直度。")
+    elif pos_worse and not ell_worse:
+        print("   特征：位置变、形状不变 → 更像支架整体被带动。优先查：")
+        print("   ① 三臂支架三个固定点高度是否一致、三臂长度是否相等（你改过孔位，重点查）；")
+        print("   ② 支架刚度：拧倾斜螺丝时支架臂是否被顶弯；③ 调焦座垂直度。")
+    else:
+        print("   特征：位置和形状都变 → 支架几何偏差较大。建议按顺序查：")
+        print("   ① 三臂支架高度/长度（垫片修正）→ ② 调焦座垂直度 → ③ 副镜安装面 45° 与贴合度；")
+        print("   修完整套重新校准，且调之前先把三颗倾斜螺丝退到行程中间。")
+
+
 def parse_rgb(s: str):
     v = [int(x) for x in s.split(",")]
     if len(v) != 3:
@@ -651,10 +763,16 @@ def main():
     ap.add_argument("--tol", type=int, default=60, help="颜色匹配容差(0-255)")
     ap.add_argument("--no-ellipse", action="store_true", help="跳过自动边缘/椭圆检测")
     ap.add_argument("--out", help="标注图输出路径")
+    ap.add_argument("--compare", nargs=2, metavar=("A", "B"),
+                    help="对比同一把镜子的两种状态（两张截图），判断调整是否互相牵连")
+    ap.add_argument("--primary-b", nargs=2, type=float, metavar=("X", "Y"),
+                    help="--compare 时第二张图的主镜中心标记坐标(第一张用 --primary)")
     args = ap.parse_args()
 
     try:
-        if args.watch:
+        if args.compare:
+            run_compare(Path(args.compare[0]).expanduser(), Path(args.compare[1]).expanduser(), args)
+        elif args.watch:
             watch(Path(args.watch), args)
         elif args.image:
             run_file(Path(args.image).expanduser(), args, notify=args.notify)
